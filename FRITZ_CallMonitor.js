@@ -23,8 +23,8 @@
 
 const net = require("net");
 
-const DP_LAST_EVENT = "0_userdata.0.Fritzbox.Fritzbox_CallMonitor";
-const DP_LAST_CALL  = "0_userdata.0.Fritzbox.Fritzbox_LastCall";
+const DP_LAST_EVENT = "0_userdata.0.Fritzbox.CallMonitor";
+const DP_LAST_CALL  = "0_userdata.0.Fritzbox.LastCall";
 const fritzIP = "192.168.246.4";
 const CM_PORT = 1012;
 

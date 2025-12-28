@@ -18,8 +18,8 @@ This repository contains JavaScript scripts intended to run inside the **ioBroke
 
 - `FRITZ_CallMonitor.js`  
   Independent CallMonitor client (TCP to FRITZ!Box port `1012`) that writes the last events / call context to:
-  - `0_userdata.0.Fritzbox.Fritzbox_CallMonitor`
-  - `0_userdata.0.Fritzbox.Fritzbox_LastCall`
+  - `0_userdata.0.Fritzbox.CallMonitor`
+  - `0_userdata.0.Fritzbox.LastCall`
 
 - `FRITZ_TAM_transcribe.js`  
   Answering machine (TAM) workflow + Azure transcription.  
@@ -102,7 +102,7 @@ You can trigger an immediate poll by writing `true` to:
 Requires:
 
 - SOAP worker datapoints (`0_userdata.0.Fritzbox.SOAP_command`, `0_userdata.0.Fritzbox.SOAP_result`)
-- CallMonitor datapoints (`0_userdata.0.Fritzbox.Fritzbox_CallMonitor`, `0_userdata.0.Fritzbox.Fritzbox_LastCall`)
+- CallMonitor datapoints (`0_userdata.0.Fritzbox.CallMonitor`, `0_userdata.0.Fritzbox.LastCall`)
 
 Configure at least:
 

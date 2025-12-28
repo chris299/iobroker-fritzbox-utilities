@@ -9,8 +9,8 @@
  *
  * Benötigte DPs (existieren bereits aus deinen anderen Scripts):
  *   CallMonitor:
- *     0_userdata.0.Fritzbox.Fritzbox_CallMonitor
- *     0_userdata.0.Fritzbox.Fritzbox_LastCall
+ *     0_userdata.0.Fritzbox.CallMonitor
+ *     0_userdata.0.Fritzbox.LastCall
  *   SOAP Worker:
  *     0_userdata.0.Fritzbox.SOAP_command
  *     0_userdata.0.Fritzbox.SOAP_result
@@ -44,17 +44,50 @@ const DEFAULT_TAM_INDEX = 1;
 // ===============================
 // SST DPs (CallMonitor + SOAP Worker)
 // ===============================
-const DP_CM_EVENT = "0_userdata.0.Fritzbox.Fritzbox_CallMonitor";
-const DP_CM_LASTCALL = "0_userdata.0.Fritzbox.Fritzbox_LastCall";
+const DP_ROOT_Fritzbox = "0_userdata.0.Fritzbox";
 
-const DP_SOAP_COMMAND = "0_userdata.0.Fritzbox.SOAP_command";
-const DP_SOAP_RESULT = "0_userdata.0.Fritzbox.SOAP_result";
+const DP_CM_EVENT    = DP_ROOT_Fritzbox + ".CallMonitor";
+const DP_CM_LASTCALL = DP_ROOT_Fritzbox + ".LastCall";
+
+const DP_SOAP_COMMAND = DP_ROOT_Fritzbox + ".SOAP_command";
+const DP_SOAP_RESULT  = DP_ROOT_Fritzbox + ".SOAP_result";
 
 // ===============================
 // Eigene TAM-Output-DPs
 // ===============================
-const DP_Fritzbox_SessionId = "0_userdata.0.Fritzbox.Fritzbox_SessionId";
-const DP_base_Fritzbox_TAM = "0_userdata.0.Fritzbox.Anrufbeantworter.";
+const DP_Fritzbox_SessionId = DP_ROOT_Fritzbox + ".SessionId";
+const DP_base_Fritzbox_TAM  = DP_ROOT_Fritzbox + ".Anrufbeantworter.";
+
+// ===============================
+// Prerequisite checks (startup)
+// ===============================
+async function logMissingPrerequisiteDatapoints() {
+  const required = [
+    DP_CM_EVENT,
+    DP_CM_LASTCALL,
+    DP_SOAP_COMMAND,
+    DP_SOAP_RESULT,
+  ];
+
+  const missing = [];
+  for (const id of required) {
+    try {
+      const ok = await existsState(id);
+      if (!ok) missing.push(id);
+    } catch (_) {
+      missing.push(id);
+    }
+  }
+
+  if (missing.length === 0) return true;
+
+  log(
+    `[TAM] Missing required datapoints at startup: ${missing.join(", ")}. ` +
+      `Please start/configure FRITZ_CallMonitor.js and FRITZ_SOAP_communication.js first.`,
+    "error"
+  );
+  return false;
+}
 
 const DP_Fritzbox_AnrufbeantworterDaten_json =
   DP_base_Fritzbox_TAM + DEFAULT_TAM_INDEX + ".Fritzbox_AnrufbeantworterDaten_json";
@@ -218,6 +251,8 @@ async function ensureStateExists(id, initialValue, common) {
   if (!getState(DP_Fritzbox_AnrufbeantworterLatestMessageEnableTranskription).val) {
     setState(DP_Fritzbox_AnrufbeantworterLatestMessageTranskript, "Transkription deaktiviert", true);
   }
+
+  await logMissingPrerequisiteDatapoints();
 })();
 
 // ===============================

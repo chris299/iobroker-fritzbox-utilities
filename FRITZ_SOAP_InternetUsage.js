@@ -2,7 +2,7 @@
  * ioBroker Script: FRITZ!Box Internetverbrauch (Tag/Monat) via SOAP Worker
  * version: 2025-12-28
  *
- * Benötigt den SOAP Worker:
+ * Benötigt den SOAP Worker (as configued in FRITZ_SOAP_communication.js)
  *   - 0_userdata.0.Fritzbox.SOAP_command
  *   - 0_userdata.0.Fritzbox.SOAP_result
  *
@@ -18,7 +18,7 @@
  *   (siehe FRITZ_SOAP_communication.js >= 2025-12-28).
  *******************************************************/
 
-const debug = true;
+const debug = false;
 
 // SOAP Worker DPs
 const DP_SOAP_COMMAND = "0_userdata.0.Fritzbox.SOAP_command";
@@ -46,6 +46,22 @@ const DP_DAY_TOTAL = DP_BASE + "day.bytesTotal";
 const DP_MONTH_SENT = DP_BASE + "month.bytesSent";
 const DP_MONTH_RECV = DP_BASE + "month.bytesReceived";
 const DP_MONTH_TOTAL = DP_BASE + "month.bytesTotal";
+
+// Snapshot DPs (written once per day/month on rollover)
+const DP_SNAPSHOT_BASE = DP_BASE + "snapshot.";
+const DP_SNAP_YESTERDAY_DAYKEY = DP_SNAPSHOT_BASE + "yesterday.dayKey";
+const DP_SNAP_YESTERDAY_VALID = DP_SNAPSHOT_BASE + "yesterday.valid";
+const DP_SNAP_YESTERDAY_TS = DP_SNAPSHOT_BASE + "yesterday.ts";
+const DP_SNAP_YESTERDAY_SENT = DP_SNAPSHOT_BASE + "yesterday.bytesSent";
+const DP_SNAP_YESTERDAY_RECV = DP_SNAPSHOT_BASE + "yesterday.bytesReceived";
+const DP_SNAP_YESTERDAY_TOTAL = DP_SNAPSHOT_BASE + "yesterday.bytesTotal";
+
+const DP_SNAP_LAST_MONTH_MONTHKEY = DP_SNAPSHOT_BASE + "last_month.monthKey";
+const DP_SNAP_LAST_MONTH_VALID = DP_SNAPSHOT_BASE + "last_month.valid";
+const DP_SNAP_LAST_MONTH_TS = DP_SNAPSHOT_BASE + "last_month.ts";
+const DP_SNAP_LAST_MONTH_SENT = DP_SNAPSHOT_BASE + "last_month.bytesSent";
+const DP_SNAP_LAST_MONTH_RECV = DP_SNAPSHOT_BASE + "last_month.bytesReceived";
+const DP_SNAP_LAST_MONTH_TOTAL = DP_SNAPSHOT_BASE + "last_month.bytesTotal";
 
 // Meta (persistente Berechnung)
 const DP_META_DAYKEY = DP_BASE + "meta.dayKey";
@@ -82,6 +98,25 @@ function safeJsonParse(s) {
   }
 }
 
+async function assertSoapWorkerInterface() {
+  const cmdExists = await existsState(DP_SOAP_COMMAND);
+  const resExists = await existsState(DP_SOAP_RESULT);
+  if (cmdExists && resExists) return true;
+
+  const missing = [];
+  if (!cmdExists) missing.push(DP_SOAP_COMMAND);
+  if (!resExists) missing.push(DP_SOAP_RESULT);
+
+  const msg =
+    `Missing SOAP worker interface datapoints: ${missing.join(", ")}. ` +
+    `Start/configure the SOAP worker script (FRITZ_SOAP_communication.js) first.`;
+
+  try { setState(DP_LAST_OK, false, true); } catch (_) {}
+  try { setState(DP_LAST_ERROR, msg, true); } catch (_) {}
+  log(`[InternetTraffic] ${msg}`, "error");
+  return false;
+}
+
 function newRequestId(prefix = "soap") {
   return `${prefix}_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
 }
@@ -112,11 +147,48 @@ function toBigIntOrZero(v) {
 }
 
 function biToString(v) {
-  try {
-    return (typeof v === "bigint") ? v.toString() : String(v);
-  } catch (_) {
-    return String(v);
-  }
+  try { return (typeof v === "bigint") ? v.toString() : String(v); } catch (_) { return String(v); }
+}
+
+function biToNumber(v) {
+  if (typeof v === "number") return v;
+  if (typeof v === "bigint") return Number(v);
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function parseDayKey(dayKey) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dayKey || "").trim());
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  if (!Number.isFinite(y) || !Number.isFinite(mo) || !Number.isFinite(d)) return null;
+  return new Date(y, mo - 1, d, 0, 0, 0, 0); // local midnight
+}
+
+function parseMonthKey(monthKey) {
+  const m = /^(\d{4})-(\d{2})$/.exec(String(monthKey || "").trim());
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  if (!Number.isFinite(y) || !Number.isFinite(mo)) return null;
+  return new Date(y, mo - 1, 1, 0, 0, 0, 0); // local first day
+}
+
+function diffDays(aDayKey, bDayKey) {
+  const a = parseDayKey(aDayKey);
+  const b = parseDayKey(bDayKey);
+  if (!a || !b) return null;
+  const ms = b.getTime() - a.getTime();
+  return Math.round(ms / (24 * 60 * 60 * 1000));
+}
+
+function diffMonths(aMonthKey, bMonthKey) {
+  const a = parseMonthKey(aMonthKey);
+  const b = parseMonthKey(bMonthKey);
+  if (!a || !b) return null;
+  return (b.getFullYear() - a.getFullYear()) * 12 + (b.getMonth() - a.getMonth());
 }
 
 function dayKeyLocal(d = new Date()) {
@@ -134,7 +206,41 @@ function monthKeyLocal(d = new Date()) {
 
 async function ensureStateExists(id, initialValue, common) {
   const exists = await existsState(id);
-  if (!exists) await createStateAsync(id, initialValue, false, common);
+  if (!exists) {
+    await createStateAsync(id, initialValue, false, common);
+    return;
+  }
+
+  // Best effort: keep object metadata in sync (unit/role/name), and optionally migrate types.
+  try {
+    const obj = await getObjectAsync(id);
+    if (!obj || !obj.common) return;
+
+    const desiredType = common?.type;
+    const currentType = obj.common.type;
+    const typeMismatch = !!desiredType && !!currentType && desiredType !== currentType;
+
+    if (typeMismatch) {
+      // Recreate state with desired type (keeps same id; history can continue).
+      const cur = await getStateAsync(id);
+      await delObjectAsync(id);
+      await createStateAsync(id, initialValue, false, common);
+
+      // Restore value if it can be converted.
+      if (cur && cur.val !== undefined) {
+        const v = desiredType === "number" ? Number(cur.val) : String(cur.val);
+        if (desiredType !== "number" || Number.isFinite(v)) {
+          setState(id, v, true);
+        }
+      }
+      return;
+    }
+
+    const nextCommon = { ...obj.common, ...common };
+    await setObjectAsync(id, { ...obj, common: nextCommon });
+  } catch (_) {
+    // ignore
+  }
 }
 
 function soapCall({ service, action, params = {}, timeoutMs = 10000, authMode = "tr64" }, waitTimeoutMs = 15000) {
@@ -181,6 +287,11 @@ async function pollTraffic({ forceDayBaseline = false, forceMonthBaseline = fals
   pollRunning = true;
   setState(DP_LAST_POLL, nowIso(), true);
 
+  if (!(await assertSoapWorkerInterface())) {
+    pollRunning = false;
+    return;
+  }
+
   try {
     const res = await soapCall(
       { service: IGD_WANCOMMON, action: "GetAddonInfos", params: {}, timeoutMs: POLL_TIMEOUT_MS, authMode: "none" },
@@ -226,6 +337,55 @@ async function pollTraffic({ forceDayBaseline = false, forceMonthBaseline = fals
     const dayChanged = dk !== storedDayKey;
     const monthChanged = mk !== storedMonthKey;
 
+    // Snapshot (yesterday / last_month) BEFORE baseline changes
+    if (dayChanged && storedDayKey) {
+      const daySentPrev = virtSent - baselineDaySent;
+      const dayRecvPrev = virtRecv - baselineDayRecv;
+      const deltaDays = diffDays(storedDayKey, dk);
+      const valid = deltaDays === 1;
+
+      setState(DP_SNAP_YESTERDAY_DAYKEY, storedDayKey, true);
+      setState(DP_SNAP_YESTERDAY_VALID, valid, true);
+      setState(DP_SNAP_YESTERDAY_TS, nowIso(), true);
+      if (valid) {
+        if (debug) {
+          log(
+            `[InternetTraffic] Snapshot yesterday dayKey=${storedDayKey} sent=${daySentPrev} recv=${dayRecvPrev} total=${daySentPrev + dayRecvPrev}`,
+            "info"
+          );
+        }
+        setState(DP_SNAP_YESTERDAY_SENT, biToNumber(daySentPrev), true);
+        setState(DP_SNAP_YESTERDAY_RECV, biToNumber(dayRecvPrev), true);
+        setState(DP_SNAP_YESTERDAY_TOTAL, biToNumber(daySentPrev + dayRecvPrev), true);
+      } else {
+        log(`[InternetTraffic] Missed days (storedDayKey=${storedDayKey} now=${dk}); yesterday snapshot not reliable`, "warn");
+      }
+    }
+
+    if (monthChanged && storedMonthKey) {
+      const monthSentPrev = virtSent - baselineMonthSent;
+      const monthRecvPrev = virtRecv - baselineMonthRecv;
+      const deltaMonths = diffMonths(storedMonthKey, mk);
+      const valid = deltaMonths === 1;
+
+      setState(DP_SNAP_LAST_MONTH_MONTHKEY, storedMonthKey, true);
+      setState(DP_SNAP_LAST_MONTH_VALID, valid, true);
+      setState(DP_SNAP_LAST_MONTH_TS, nowIso(), true);
+      if (valid) {
+        if (debug) {
+          log(
+            `[InternetTraffic] Snapshot last_month monthKey=${storedMonthKey} sent=${monthSentPrev} recv=${monthRecvPrev} total=${monthSentPrev + monthRecvPrev}`,
+            "info"
+          );
+        }
+        setState(DP_SNAP_LAST_MONTH_SENT, biToNumber(monthSentPrev), true);
+        setState(DP_SNAP_LAST_MONTH_RECV, biToNumber(monthRecvPrev), true);
+        setState(DP_SNAP_LAST_MONTH_TOTAL, biToNumber(monthSentPrev + monthRecvPrev), true);
+      } else {
+        log(`[InternetTraffic] Missed months (storedMonthKey=${storedMonthKey} now=${mk}); last_month snapshot not reliable`, "warn");
+      }
+    }
+
     if (dayChanged || forceDayBaseline || !storedDayKey) {
       baselineDaySent = virtSent;
       baselineDayRecv = virtRecv;
@@ -253,26 +413,33 @@ async function pollTraffic({ forceDayBaseline = false, forceMonthBaseline = fals
     setState(DP_META_LAST_CUR_SENT, biToString(curSent), true);
     setState(DP_META_LAST_CUR_RECV, biToString(curRecv), true);
 
-    // Raw / Calc speichern (Bytes > 2^53 als String)
-    setState(DP_RAW_SENT64, biToString(curSent), true);
-    setState(DP_RAW_RECV64, biToString(curRecv), true);
+    // Raw / Calc speichern
+    setState(DP_RAW_SENT64, biToNumber(curSent), true);
+    setState(DP_RAW_RECV64, biToNumber(curRecv), true);
     setState(DP_RAW_SENDRATE, Number.isFinite(byteSendRate) ? byteSendRate : 0, true);
     setState(DP_RAW_RECVRATE, Number.isFinite(byteReceiveRate) ? byteReceiveRate : 0, true);
 
-    setState(DP_VIRTUAL_SENT, biToString(virtSent), true);
-    setState(DP_VIRTUAL_RECV, biToString(virtRecv), true);
+    setState(DP_VIRTUAL_SENT, biToNumber(virtSent), true);
+    setState(DP_VIRTUAL_RECV, biToNumber(virtRecv), true);
 
-    setState(DP_DAY_SENT, biToString(daySent), true);
-    setState(DP_DAY_RECV, biToString(dayRecv), true);
-    setState(DP_DAY_TOTAL, biToString(daySent + dayRecv), true);
+    setState(DP_DAY_SENT, biToNumber(daySent), true);
+    setState(DP_DAY_RECV, biToNumber(dayRecv), true);
+    setState(DP_DAY_TOTAL, biToNumber(daySent + dayRecv), true);
 
-    setState(DP_MONTH_SENT, biToString(monthSent), true);
-    setState(DP_MONTH_RECV, biToString(monthRecv), true);
-    setState(DP_MONTH_TOTAL, biToString(monthSent + monthRecv), true);
+    setState(DP_MONTH_SENT, biToNumber(monthSent), true);
+    setState(DP_MONTH_RECV, biToNumber(monthRecv), true);
+    setState(DP_MONTH_TOTAL, biToNumber(monthSent + monthRecv), true);
 
     setState(DP_LAST_OK, true, true);
     setState(DP_LAST_ERROR, "", true);
-    if (debug) log(`[InternetTraffic] OK sent64=${curSent} recv64=${curRecv} day=${daySent + dayRecv} month=${monthSent + monthRecv}`, "info");
+    if (debug) {
+      log(
+        `[InternetTraffic] OK rawSent64=${curSent} rawRecv64=${curRecv} ` +
+          `daySent=${daySent} dayRecv=${dayRecv} dayTotal=${daySent + dayRecv} ` +
+          `monthSent=${monthSent} monthRecv=${monthRecv} monthTotal=${monthSent + monthRecv}`,
+        "info"
+      );
+    }
   } catch (e) {
     setState(DP_LAST_OK, false, true);
     setState(DP_LAST_ERROR, String(e.message || e), true);
@@ -287,25 +454,43 @@ async function pollTraffic({ forceDayBaseline = false, forceMonthBaseline = fals
 // -------------------------------
 (async () => {
   await ensureStateExists(DP_POLL_NOW, false, { name: "Poll now", type: "boolean", role: "button", read: true, write: true });
-  await ensureStateExists(DP_LAST_POLL, "", { name: "Last poll ISO", type: "string", role: "text", read: true, write: false });
+  await ensureStateExists(DP_LAST_POLL, "", { name: "Last poll ISO", type: "string", role: "date", read: true, write: false });
   await ensureStateExists(DP_LAST_OK, false, { name: "Last poll ok", type: "boolean", role: "indicator", read: true, write: false });
   await ensureStateExists(DP_LAST_ERROR, "", { name: "Last error", type: "string", role: "text", read: true, write: false });
 
-  await ensureStateExists(DP_RAW_SENT64, "0", { name: "Raw total bytes sent (64)", type: "string", role: "value", read: true, write: false });
-  await ensureStateExists(DP_RAW_RECV64, "0", { name: "Raw total bytes received (64)", type: "string", role: "value", read: true, write: false });
-  await ensureStateExists(DP_RAW_SENDRATE, 0, { name: "Current byte send rate", type: "number", role: "value", read: true, write: false });
-  await ensureStateExists(DP_RAW_RECVRATE, 0, { name: "Current byte receive rate", type: "number", role: "value", read: true, write: false });
+  // Early warning if SOAP worker isn't running / datapoints are missing.
+  await assertSoapWorkerInterface();
 
-  await ensureStateExists(DP_VIRTUAL_SENT, "0", { name: "Virtual bytes sent", type: "string", role: "value", read: true, write: false });
-  await ensureStateExists(DP_VIRTUAL_RECV, "0", { name: "Virtual bytes received", type: "string", role: "value", read: true, write: false });
+  await ensureStateExists(DP_RAW_SENT64, 0, { name: "Raw total bytes sent (64)", type: "number", role: "value", unit: "byte", read: true, write: false });
+  await ensureStateExists(DP_RAW_RECV64, 0, { name: "Raw total bytes received (64)", type: "number", role: "value", unit: "byte", read: true, write: false });
+  await ensureStateExists(DP_RAW_SENDRATE, 0, { name: "Current byte send rate", type: "number", role: "value", unit: "byte/s", read: true, write: false });
+  await ensureStateExists(DP_RAW_RECVRATE, 0, { name: "Current byte receive rate", type: "number", role: "value", unit: "byte/s", read: true, write: false });
 
-  await ensureStateExists(DP_DAY_SENT, "0", { name: "Day bytes sent", type: "string", role: "value", read: true, write: false });
-  await ensureStateExists(DP_DAY_RECV, "0", { name: "Day bytes received", type: "string", role: "value", read: true, write: false });
-  await ensureStateExists(DP_DAY_TOTAL, "0", { name: "Day bytes total", type: "string", role: "value", read: true, write: false });
+  await ensureStateExists(DP_VIRTUAL_SENT, 0, { name: "Virtual bytes sent", type: "number", role: "value", unit: "byte", read: true, write: false });
+  await ensureStateExists(DP_VIRTUAL_RECV, 0, { name: "Virtual bytes received", type: "number", role: "value", unit: "byte", read: true, write: false });
 
-  await ensureStateExists(DP_MONTH_SENT, "0", { name: "Month bytes sent", type: "string", role: "value", read: true, write: false });
-  await ensureStateExists(DP_MONTH_RECV, "0", { name: "Month bytes received", type: "string", role: "value", read: true, write: false });
-  await ensureStateExists(DP_MONTH_TOTAL, "0", { name: "Month bytes total", type: "string", role: "value", read: true, write: false });
+  await ensureStateExists(DP_DAY_SENT, 0, { name: "Day bytes sent", type: "number", role: "value", unit: "byte", read: true, write: false });
+  await ensureStateExists(DP_DAY_RECV, 0, { name: "Day bytes received", type: "number", role: "value", unit: "byte", read: true, write: false });
+  await ensureStateExists(DP_DAY_TOTAL, 0, { name: "Day bytes total", type: "number", role: "value", unit: "byte", read: true, write: false });
+
+  await ensureStateExists(DP_MONTH_SENT, 0, { name: "Month bytes sent", type: "number", role: "value", unit: "byte", read: true, write: false });
+  await ensureStateExists(DP_MONTH_RECV, 0, { name: "Month bytes received", type: "number", role: "value", unit: "byte", read: true, write: false });
+  await ensureStateExists(DP_MONTH_TOTAL, 0, { name: "Month bytes total", type: "number", role: "value", unit: "byte", read: true, write: false });
+
+  // Snapshots (yesterday / last_month)
+  await ensureStateExists(DP_SNAP_YESTERDAY_DAYKEY, "", { name: "Yesterday dayKey (YYYY-MM-DD)", type: "string", role: "text", read: true, write: false });
+  await ensureStateExists(DP_SNAP_YESTERDAY_VALID, false, { name: "Yesterday snapshot valid", type: "boolean", role: "indicator", read: true, write: false });
+  await ensureStateExists(DP_SNAP_YESTERDAY_TS, "", { name: "Yesterday snapshot written at (ISO)", type: "string", role: "date", read: true, write: false });
+  await ensureStateExists(DP_SNAP_YESTERDAY_SENT, 0, { name: "Yesterday bytes sent", type: "number", role: "value", unit: "byte", read: true, write: false });
+  await ensureStateExists(DP_SNAP_YESTERDAY_RECV, 0, { name: "Yesterday bytes received", type: "number", role: "value", unit: "byte", read: true, write: false });
+  await ensureStateExists(DP_SNAP_YESTERDAY_TOTAL, 0, { name: "Yesterday bytes total", type: "number", role: "value", unit: "byte", read: true, write: false });
+
+  await ensureStateExists(DP_SNAP_LAST_MONTH_MONTHKEY, "", { name: "Last month monthKey (YYYY-MM)", type: "string", role: "text", read: true, write: false });
+  await ensureStateExists(DP_SNAP_LAST_MONTH_VALID, false, { name: "Last month snapshot valid", type: "boolean", role: "indicator", read: true, write: false });
+  await ensureStateExists(DP_SNAP_LAST_MONTH_TS, "", { name: "Last month snapshot written at (ISO)", type: "string", role: "date", read: true, write: false });
+  await ensureStateExists(DP_SNAP_LAST_MONTH_SENT, 0, { name: "Last month bytes sent", type: "number", role: "value", unit: "byte", read: true, write: false });
+  await ensureStateExists(DP_SNAP_LAST_MONTH_RECV, 0, { name: "Last month bytes received", type: "number", role: "value", unit: "byte", read: true, write: false });
+  await ensureStateExists(DP_SNAP_LAST_MONTH_TOTAL, 0, { name: "Last month bytes total", type: "number", role: "value", unit: "byte", read: true, write: false });
 
   await ensureStateExists(DP_META_DAYKEY, "", { name: "Meta dayKey", type: "string", role: "text", read: true, write: false });
   await ensureStateExists(DP_META_MONTHKEY, "", { name: "Meta monthKey", type: "string", role: "text", read: true, write: false });
@@ -344,4 +529,3 @@ async function pollTraffic({ forceDayBaseline = false, forceMonthBaseline = fals
 onStop(() => {
   // nothing
 }, 1000);
-
