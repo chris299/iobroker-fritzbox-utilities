@@ -780,7 +780,7 @@ on({ id: DP_CM_EVENT, change: "ne" }, async (obj) => {
   if (evt.type !== "DISCONNECT") return;
 
   // kleine Verzögerung, damit LastCall sicher geschrieben ist
-  await wait(300);
+  await wait(5000); // war 300
 
   const lastCall = safeJsonParse(getState(DP_CM_LASTCALL).val) || {};
 
