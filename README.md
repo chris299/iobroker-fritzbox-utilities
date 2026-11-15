@@ -116,6 +116,11 @@ Behavior:
 
 - Manually trigger by toggling `0_userdata.0.Fritzbox.Anrufbeantworter.<DEFAULT_TAM_INDEX>.Fritzbox_AnrufbeantworterDatenAktualisieren` (the script creates its output datapoints for `DEFAULT_TAM_INDEX`)
 - Automatically triggers on CallMonitor `DISCONNECT` events when the script detects a TAM port (heuristic: extensions `40..49`)
+- Processes **every message not processed yet**, oldest first, not just the newest one. Processed messages are remembered in `…Fritzbox_AnrufbeantworterProcessedMessages` by the key `Date|Index|Number|Duration` (the FRITZ!Box reuses message indexes after a while, and its `New` flag is reset when someone listens on the phone).
+- On the very first start, all messages already on the TAM are marked as processed, so no old messages get transcribed. On later starts, messages that arrived while the script was stopped are picked up.
+- After a TAM call ends, the message sometimes shows up in the FRITZ!Box list only a few seconds later. The script polls the list every `POLL_INTERVAL_MS` (5 s) for up to `POLL_MAX_MS` (60 s).
+- After each message it writes `…Fritzbox_AnrufbeantworterLastProcessedMessage` (JSON: date, name, number, transcript, local WAV path, …). Trigger notifications on this datapoint: it changes for every message, while `…LatestMessageTranskript` does not change when two transcripts are identical (e.g. empty messages).
+- At most `MAX_NEW_PER_RUN` (10) messages are transcribed per run, the newest ones. This guards against a flood of notifications if the list of processed messages gets lost.
 
 ## Security
 

@@ -1,7 +1,13 @@
 /**
- * version 2025-12-27
+ * version 2026-11-15
  *
  * ioBroker Script B: FRITZ!Box Anrufbeantworter mit Azure Transkription (via SOAP Worker)
+ *
+ * Verarbeitet werden alle Nachrichten, die noch nicht verarbeitet wurden, nicht
+ * nur die neueste. Welche schon dran waren, steht in
+ * ...Fritzbox_AnrufbeantworterProcessedMessages. Nach jeder Nachricht wird
+ * ...Fritzbox_AnrufbeantworterLastProcessedMessage geschrieben (JSON mit
+ * Metadaten und Transkript), darauf kann ein Benachrichtigungs-Script reagieren.
  *
  * Dieses Script nutzt:
  * - Trigger: CallMonitor (Port 1012) DPs aus  CallMonitor-Script
@@ -40,6 +46,17 @@ const TAM_EXPECTED_LANGUAGE = "de-DE";
 
 // Standard-TAM (Fallback), falls kein ext 40-49 erkennbar
 const DEFAULT_TAM_INDEX = 1;
+
+// Nach dem Auflegen steht die neue Nachricht manchmal erst nach einigen
+// Sekunden in der Liste der FRITZ!Box. Deshalb wiederholt nachsehen statt
+// einmal fest zu warten.
+const POLL_INTERVAL_MS = 5000;
+const POLL_MAX_MS = 60000;
+
+// Sicherung gegen eine Flut von Transkripten und Meldungen, falls die Liste
+// der verarbeiteten Nachrichten verloren geht: höchstens so viele pro Lauf,
+// die neuesten. Ältere werden ohne Transkript als verarbeitet gemerkt.
+const MAX_NEW_PER_RUN = 10;
 
 // ===============================
 // SST DPs (CallMonitor + SOAP Worker)
@@ -114,6 +131,10 @@ const DP_Fritzbox_AnrufbeantworterLatestMessageEnableTranskription =
   DP_base_Fritzbox_TAM + DEFAULT_TAM_INDEX + ".Fritzbox_AnrufbeantworterLatestMessageEnableTranskription";
 const DP_Fritzbox_AnrufbeantworterLatestMessageTranskript =
   DP_base_Fritzbox_TAM + DEFAULT_TAM_INDEX + ".Fritzbox_AnrufbeantworterLatestMessageTranskript";
+const DP_Fritzbox_AnrufbeantworterProcessedMessages =
+  DP_base_Fritzbox_TAM + DEFAULT_TAM_INDEX + ".Fritzbox_AnrufbeantworterProcessedMessages";
+const DP_Fritzbox_AnrufbeantworterLastProcessedMessage =
+  DP_base_Fritzbox_TAM + DEFAULT_TAM_INDEX + ".Fritzbox_AnrufbeantworterLastProcessedMessage";
 
 // ===============================
 // State Setup
@@ -248,11 +269,37 @@ async function ensureStateExists(id, initialValue, common) {
     write: true,
   });
 
+  // Leer = noch nie initialisiert. Der erste Lauf markiert dann alles, was
+  // schon auf dem AB liegt, als verarbeitet.
+  await ensureStateExists(DP_Fritzbox_AnrufbeantworterProcessedMessages, "", {
+    name: "Schlüssel der schon verarbeiteten Nachrichten (JSON-Array)",
+    type: "string",
+    role: "json",
+    def: "",
+    read: true,
+    write: true,
+  });
+
+  await ensureStateExists(DP_Fritzbox_AnrufbeantworterLastProcessedMessage, "", {
+    name: "Zuletzt verarbeitete Nachricht mit Transkript (JSON), ändert sich bei jeder Nachricht",
+    type: "string",
+    role: "json",
+    def: "",
+    read: true,
+    write: false,
+  });
+
   if (!getState(DP_Fritzbox_AnrufbeantworterLatestMessageEnableTranskription).val) {
     setState(DP_Fritzbox_AnrufbeantworterLatestMessageTranskript, "Transkription deaktiviert", true);
   }
 
-  await logMissingPrerequisiteDatapoints();
+  if (await logMissingPrerequisiteDatapoints()) {
+    // Gleich beim Start einmal durchlaufen: Beim allerersten Start wird
+    // initialisiert (sonst ginge ausgerechnet die erste echte neue Nachricht
+    // in der Erstmarkierung unter), danach werden Nachrichten nachgeholt, die
+    // ankamen, während das Script nicht lief.
+    await runTamWorkflow(DEFAULT_TAM_INDEX, false);
+  }
 })();
 
 // ===============================
@@ -342,23 +389,14 @@ function httpPostP(url, body, options) {
 // ===============================
 // UI helper: Select JSON bauen (Material Design Select)
 // ===============================
-function setSelectOptionsEmpty() {
-  setState(DP_Fritzbox_AnrufbeantworterIndexMessage_json, "", true);
+// Einmal pro Abruf schreiben: Die Liste wird beim Warten auf eine neue
+// Nachricht mehrfach geholt, ein Schreibvorgang pro Eintrag wäre zu viel.
+function selectOption(text, subText = "", value = "", icon = "phone-message-outline", iconColor = "red") {
+  return { text, subText, value, icon, iconColor };
 }
 
-function pushSelectOption(text, subText = "", value = "", icon = "phone-message-outline", iconColor = "red") {
-  let json = getState(DP_Fritzbox_AnrufbeantworterIndexMessage_json).val;
-  let arr = [];
-  if (json) {
-    try {
-      arr = JSON.parse(json);
-      if (!Array.isArray(arr)) arr = [];
-    } catch (_) {
-      arr = [];
-    }
-  }
-  arr.push({ text, subText, value, icon, iconColor });
-  setState(DP_Fritzbox_AnrufbeantworterIndexMessage_json, JSON.stringify(arr), true);
+function setSelectOptions(options) {
+  setState(DP_Fritzbox_AnrufbeantworterIndexMessage_json, JSON.stringify(options), true);
 }
 
 // ===============================
@@ -394,57 +432,84 @@ function createTempFileSafe(filename, data) {
 }
 
 // ===============================
-// TAM: parse newest message
+// TAM: Nachrichten-Helfer
 // ===============================
-function getNewestMessageIndexByDate(data) {
-  const messages = data?.Root?.Message;
-  if (!Array.isArray(messages) || messages.length === 0) return null;
+// Datum der FRITZ!Box im Format "08.06.25 19:02" -> Millisekunden (0 wenn unlesbar)
+function parseTamDate(dateStr) {
+  const [datePart, timePart] = String(dateStr || "").trim().split(" ");
+  if (!datePart || !timePart) return 0;
 
-  let newestMessage = null;
-  let newestDate = null;
+  const [day, month, year] = datePart.split(".");
+  const [hour, minute] = timePart.split(":");
+  if (!day || !month || !year || !hour || !minute) return 0;
 
-  messages.forEach((msg) => {
-    const dateStr = msg?.Date?.[0];
-    if (!dateStr) return;
+  const fullYear = parseInt("20" + year, 10);
+  return new Date(fullYear, parseInt(month, 10) - 1, parseInt(day, 10), parseInt(hour, 10), parseInt(minute, 10)).getTime();
+}
 
-    // Format: "08.06.25 19:02"
-    const [datePart, timePart] = dateStr.split(" ");
-    if (!datePart || !timePart) return;
+// Eindeutiger Schlüssel einer Nachricht. Der Index allein reicht nicht, die
+// FRITZ!Box vergibt ihn nach einiger Zeit neu (beobachtet: Sprung von 242 auf
+// 154). Das Feld "New" taugt auch nicht: Es wird beim Abhören am Telefon
+// zurückgesetzt.
+function messageKey(msg) {
+  return ["Date", "Index", "Number", "Duration"].map((f) => String(msg?.[f]?.[0] ?? "").trim()).join("|");
+}
 
-    const [day, month, year] = datePart.split(".");
-    const [hour, minute] = timePart.split(":");
-    if (!day || !month || !year || !hour || !minute) return;
+// ===============================
+// Verarbeitete Nachrichten merken
+// ===============================
+// null = noch nie initialisiert (oder unlesbar)
+function loadProcessedKeys() {
+  const raw = getState(DP_Fritzbox_AnrufbeantworterProcessedMessages)?.val;
+  if (raw === null || raw === undefined || raw === "") return null;
 
-    const fullYear = parseInt("20" + year, 10);
-    const date = new Date(fullYear, parseInt(month, 10) - 1, parseInt(day, 10), parseInt(hour, 10), parseInt(minute, 10));
+  const arr = safeJsonParse(raw);
+  if (!Array.isArray(arr)) {
+    log("[TAM] Liste der verarbeiteten Nachrichten unlesbar, wird neu angelegt", "warn");
+    return null;
+  }
+  return new Set(arr);
+}
 
-    if (!newestDate || date > newestDate) {
-      newestDate = date;
-      newestMessage = msg;
-    }
-  });
-
-  if (debug) console.log(`[TAM] latest Message: ${newestDate ? newestDate.toLocaleString('de-DE', { timeZone: 'Europe/Berlin' }) : "N/A"}`);
-  
-  return newestMessage ? parseInt(newestMessage.Index[0], 10) : null;
+function saveProcessedKeys(processed, messages) {
+  let keys = [...processed];
+  // Nur Schlüssel behalten, die noch auf dem AB liegen: Gelöschte Nachrichten
+  // kommen nicht wieder, so wächst die Liste nicht unbegrenzt. Bei einer leeren
+  // Liste nichts wegwerfen, die könnte auch ein Aussetzer der FRITZ!Box sein.
+  if (messages.length > 0) {
+    const current = new Set(messages.map(messageKey));
+    keys = keys.filter((k) => current.has(k));
+  }
+  setState(DP_Fritzbox_AnrufbeantworterProcessedMessages, JSON.stringify(keys), true);
 }
 
 // ===============================
 // TAM Workflow Engine (Mutex gegen Parallelität)
 // ===============================
 let workflowRunning = false;
+// Aufruf, der während eines Laufs kam. Nicht verwerfen: Ein zweiter Anruf,
+// während der erste noch auf seine Nachricht wartet, bringt eine weitere.
+let workflowRerun = null;
 
-async function runTamWorkflow(tamIndex) {
+async function runTamWorkflow(tamIndex, waitForNew = false) {
   if (workflowRunning) {
-    if (debug) console.log(`[TAM] Workflow läuft bereits, skip (tamIndex=${tamIndex})`);
+    workflowRerun = { tamIndex, waitForNew: waitForNew || !!workflowRerun?.waitForNew };
+    if (debug) console.log(`[TAM] Workflow läuft bereits, danach erneut (tamIndex=${tamIndex})`);
     return;
   }
   workflowRunning = true;
 
   try {
-    await refreshTamMessageListAndMaybeTranscribe(tamIndex);
-  } catch (e) {
-    log(`[TAM] Workflow Fehler: ${String(e.message || e)}`, "error");
+    let next = { tamIndex, waitForNew };
+    while (next) {
+      workflowRerun = null;
+      try {
+        await processNewTamMessages(next.tamIndex, next.waitForNew);
+      } catch (e) {
+        log(`[TAM] Workflow Fehler: ${String(e.message || e)}`, "error");
+      }
+      next = workflowRerun;
+    }
   } finally {
     workflowRunning = false;
   }
@@ -470,9 +535,67 @@ async function deleteTamMessage(tamIndex, messageIndex) {
 }
 
 // ===============================
-// Kernfunktion: GetMessageList -> calllist.xml -> parse -> newest -> download -> transcribe
+// Kernfunktion: alle noch nicht verarbeiteten Nachrichten abarbeiten
 // ===============================
-async function refreshTamMessageListAndMaybeTranscribe(tamIndex) {
+async function processNewTamMessages(tamIndex, waitForNew) {
+  const deadline = Date.now() + (waitForNew ? POLL_MAX_MS : 0);
+  let list;
+  let processed;
+  let pending;
+
+  for (;;) {
+    list = await fetchTamMessageList(tamIndex);
+
+    processed = loadProcessedKeys();
+    if (processed === null) {
+      // Erster Lauf: Alles, was schon auf dem AB liegt, gilt als verarbeitet.
+      // Sonst kämen Transkripte und Meldungen für alle alten Nachrichten.
+      processed = new Set(list.messages.map(messageKey));
+      saveProcessedKeys(processed, list.messages);
+      log(`[TAM] Erster Lauf: ${processed.size} vorhandene Nachrichten als verarbeitet markiert`, "info");
+      return;
+    }
+
+    pending = list.messages.filter((msg) => !processed.has(messageKey(msg)));
+    if (pending.length > 0 || Date.now() >= deadline) break;
+    await wait(POLL_INTERVAL_MS);
+  }
+
+  if (pending.length === 0) {
+    if (debug && waitForNew) console.log("[TAM] Keine neue Nachricht gefunden (vor dem Signalton aufgelegt?)");
+    return;
+  }
+
+  // Älteste zuerst, damit die Meldungen in der richtigen Reihenfolge kommen
+  pending.sort((a, b) => parseTamDate(a?.Date?.[0]) - parseTamDate(b?.Date?.[0]));
+
+  if (pending.length > MAX_NEW_PER_RUN) {
+    const skipped = pending.splice(0, pending.length - MAX_NEW_PER_RUN);
+    skipped.forEach((msg) => processed.add(messageKey(msg)));
+    log(
+      `[TAM] ${skipped.length + pending.length} unverarbeitete Nachrichten, nur die neuesten ${pending.length} werden transkribiert`,
+      "warn"
+    );
+  }
+
+  for (const msg of pending) {
+    try {
+      await processTamMessage(msg, list);
+      processed.add(messageKey(msg));
+      saveProcessedKeys(processed, list.messages);
+    } catch (e) {
+      // Nicht als verarbeitet merken, beim nächsten Lauf gibt es einen neuen Versuch
+      log(`[TAM] Nachricht ${msg?.Index?.[0]} nicht verarbeitet: ${String(e.message || e)}`, "error");
+    }
+  }
+
+  saveProcessedKeys(processed, list.messages);
+}
+
+// ===============================
+// GetMessageList -> calllist.xml -> parse, dazu die Anzeige-DPs aktualisieren
+// ===============================
+async function fetchTamMessageList(tamIndex) {
   const parseString = require("xml2js").parseString;
 
   // 1) SOAP GetMessageList via Worker
@@ -499,12 +622,9 @@ async function refreshTamMessageListAndMaybeTranscribe(tamIndex) {
 
   const baseUrl = fullCalllistUrl.origin + fullCalllistUrl.pathname; // ohne Query
 
-  if (debug) console.log(`[TAM] NewURL=${newUrl}`);
-  if (debug) console.log(`[TAM] baseUrl=${baseUrl} sid=${sid} tamIndex=${tamIndex}`);
+  if (debug) console.log(`[TAM] baseUrl=${baseUrl} tamIndex=${tamIndex}`);
 
   // 3) calllist.xml holen (FRITZ!Box docu verlangt POST sid + tamindex, geht aber auch per GET)
-  setSelectOptionsEmpty();
-
   const postBody = `sid=${encodeURIComponent(sid)}&tamindex=${encodeURIComponent(tamIndex)}`;
 
   const callListResp = await httpPostP(
@@ -529,15 +649,10 @@ async function refreshTamMessageListAndMaybeTranscribe(tamIndex) {
 
   const xml = String(callListResp.data || "");
 
-  //if (debug) console.log("[TAM] Get tam CallList response raw:");
-  //if (debug) console.log(xml);
-
-
   // Anzahl Calls aus Kommentar "<!-- tam calls:X -->"
   const m = /<!--\s*tam calls:\s*(\d+)\s*-->/i.exec(xml);
   const tamCalls = m ? parseInt(m[1], 10) : 0;
 
-  if (debug) console.log(`[TAM] tam calls=${tamCalls}`);
   setState(DP_Fritzbox_AnrufbeantworterGesamtAnzahlNachrichten, tamCalls, true);
 
   // 4) XML -> JSON (xml2js)
@@ -549,69 +664,34 @@ async function refreshTamMessageListAndMaybeTranscribe(tamIndex) {
     );
   });
 
-  if (debug) console.log("[TAM] calllist JSON:"+  JSON.stringify(parsed));
+  // Nicht die ganze Liste loggen: Sie enthält Namen und Nummern aller Anrufer,
+  // und beim Warten auf eine neue Nachricht wird sie mehrfach geholt.
+  const messages = Array.isArray(parsed?.Root?.Message) ? parsed.Root.Message.slice() : [];
+  if (debug) console.log(`[TAM] tam calls=${tamCalls}, Nachrichten in der Liste: ${messages.length}`);
+
+  const list = { messages, sid, origin: fullCalllistUrl.origin };
 
   // 5) Wenn keine Nachrichten
-  if (!tamCalls || tamCalls === 0 || !parsed?.Root?.Message) {
+  if (!tamCalls || tamCalls === 0 || messages.length === 0) {
     const placeholder =
       '[{"Index":["---"],"Tam":["---"],"Called":["---"],"Date":["---"],"Duration":["---"],"Inbook":["---"],"Name":["---"],"New":["---"],"Number":["---"],"Path":["---"]}]';
 
     setState(DP_Fritzbox_AnrufbeantworterAnzahlNeueNachrichten, 0, true);
     setState(DP_Fritzbox_AnrufbeantworterDaten_json, placeholder, true);
-    pushSelectOption("Keine Nachricht vorhanden", "", "", "phone-message-outline", "red");
-    return;
+    setSelectOptions([selectOption("Keine Nachricht vorhanden", "", "", "phone-message-outline", "red")]);
+    list.messages = [];
+    return list;
   }
 
   // 6) Daten setzen (vereinfachter als früher: wir speichern das komplette parsed JSON als string)
   setState(DP_Fritzbox_AnrufbeantworterDaten_json, JSON.stringify(parsed), true);
 
-  // 7) Neueste Message finden
-  const newestIndex = getNewestMessageIndexByDate(parsed);
-  if (newestIndex === null || newestIndex === undefined) {
-    throw new Error("Konnte neueste Message nicht bestimmen (Date parsing?)");
-  }
-
-  setState(DP_Fritzbox_AnrufbeantworterLatestMessageIndex, newestIndex, true);
-
-  const latestMsg = parsed.Root.Message.find((msg) => msg?.Index?.[0] === String(newestIndex));
-  if (!latestMsg) throw new Error("Latest message not found in parsed list");
-
-  // flatten arrays (Key -> first element)
-  const flattened = Object.fromEntries(Object.entries(latestMsg).map(([k, v]) => [k, Array.isArray(v) ? v[0] : v]));
-  setState(DP_Fritzbox_AnrufbeantworterLatestMessageData, JSON.stringify(flattened), true);
-
-  const pathRel = latestMsg?.Path?.[0];
-  if (!pathRel) throw new Error("Latest message Path missing");
-
-  // Download URL (Message) – host aus calllist URL
-  const latestMessageUrl = `${fullCalllistUrl.origin}${pathRel}`;
-  setState(DP_Fritzbox_AnrufbeantworterLatestMessagePath, latestMessageUrl, true);
-
-  if (debug) console.log(`[TAM] Latest message index=${newestIndex} url=${latestMessageUrl}`);
-
-  // 8) Index-Liste für UI + Anzahl neue Nachrichten
+  // 7) Index-Liste für UI + Anzahl neue Nachrichten, neueste oben
   let newCount = 0;
+  const options = [];
+  const sorted = messages.slice().sort((a, b) => parseTamDate(b?.Date?.[0]) - parseTamDate(a?.Date?.[0]));
 
-  // optional: sortiere nach Datum absteigend (neueste oben)
-  const messages = Array.isArray(parsed?.Root?.Message) ? parsed.Root.Message.slice() : [];
-  messages.sort((a, b) => {
-    const da = String(a?.Date?.[0] || "");
-    const db = String(b?.Date?.[0] || "");
-    // simple: lexikalisch ist bei "DD.MM.YY HH:MM" NICHT sicher korrekt,
-    // daher grob: wir parsen wie in getNewestMessageIndexByDate
-    const toDate = (s) => {
-      const [d, t] = s.split(" ");
-      if (!d || !t) return 0;
-      const [day, mon, yy] = d.split(".");
-      const [hh, mm] = t.split(":");
-      if (!day || !mon || !yy || !hh || !mm) return 0;
-      const fullYear = parseInt("20" + yy, 10);
-      return new Date(fullYear, parseInt(mon, 10) - 1, parseInt(day, 10), parseInt(hh, 10), parseInt(mm, 10)).getTime();
-    };
-  return toDate(db) - toDate(da);
-  });
-
-  for (const msg of messages) {
+  for (const msg of sorted) {
     const idx = String(msg?.Index?.[0] || "").trim();
     if (!idx) continue;
 
@@ -634,16 +714,39 @@ async function refreshTamMessageListAndMaybeTranscribe(tamIndex) {
     // farblich neu/alt unterscheiden
     const iconColor = isNew ? "red" : "gray";
 
-    pushSelectOption(text, subText, idx, "phone-message-outline", iconColor);
+    options.push(selectOption(text, subText, idx, "phone-message-outline", iconColor));
   }
 
+  setSelectOptions(options);
   setState(DP_Fritzbox_AnrufbeantworterAnzahlNeueNachrichten, newCount, true);
 
+  return list;
+}
 
-  // 9) WAV herunterladen
+// ===============================
+// Eine Nachricht: Latest-DPs setzen -> WAV herunterladen -> transkribieren
+// ===============================
+async function processTamMessage(msg, list) {
+  const index = parseInt(msg?.Index?.[0], 10);
+  setState(DP_Fritzbox_AnrufbeantworterLatestMessageIndex, index, true);
+
+  // flatten arrays (Key -> first element)
+  const flattened = Object.fromEntries(Object.entries(msg).map(([k, v]) => [k, Array.isArray(v) ? v[0] : v]));
+  setState(DP_Fritzbox_AnrufbeantworterLatestMessageData, JSON.stringify(flattened), true);
+
+  const pathRel = msg?.Path?.[0];
+  if (!pathRel) throw new Error("Message Path missing");
+
+  // Download URL (Message) – host aus calllist URL
+  const messageUrl = `${list.origin}${pathRel}`;
+  setState(DP_Fritzbox_AnrufbeantworterLatestMessagePath, messageUrl, true);
+
+  if (debug) console.log(`[TAM] Verarbeite Nachricht index=${index} vom ${flattened.Date}`);
+
+  // WAV herunterladen
   const wavResp = await httpPostP(
-    latestMessageUrl,
-    `sid=${encodeURIComponent(sid)}`,
+    messageUrl,
+    `sid=${encodeURIComponent(list.sid)}`,
     {
       timeout: 10000,
       responseType: "arraybuffer",
@@ -669,29 +772,52 @@ async function refreshTamMessageListAndMaybeTranscribe(tamIndex) {
     log("[TAM] WAV Header OK", "info");
   }
 
-  const tempFilePath = createTempFileSafe("message.wav", wavResp.data);
+  // Eigener Dateiname je Nachricht: Werden mehrere nacheinander verarbeitet,
+  // darf die nächste die Datei nicht überschreiben, bevor sie verschickt ist.
+  const tempFilePath = createTempFileSafe(`message_${index}_${Date.now()}.wav`, wavResp.data);
   setState(DP_Fritzbox_AnrufbeantworterLatestMessageLocalPath, tempFilePath, true);
   if (debug) console.log(`[TAM] WAV gespeichert: ${tempFilePath}`);
 
-  // 10) Optional: Transcribe
+  // Optional: Transcribe
+  let transcript;
   const transcribeEnabled = !!getState(DP_Fritzbox_AnrufbeantworterLatestMessageEnableTranskription).val;
   if (!transcribeEnabled) {
-    setState(DP_Fritzbox_AnrufbeantworterLatestMessageTranskript, "Transkription deaktiviert", true);
+    transcript = "Transkription deaktiviert";
     if (debug) console.log("[TAM] Transkription deaktiviert");
-    return;
+  } else if (!AZURE_KEY || AZURE_KEY === "PUT_YOUR_KEY_HERE" || AZURE_KEY === "fill_your_own_key_here") {
+    transcript = "Azure Key fehlt – Transkription nicht möglich";
+  } else {
+    transcript = await transcribeWithAzure(tempFilePath);
   }
 
-  if (!AZURE_KEY || AZURE_KEY === "PUT_YOUR_KEY_HERE") {
-    setState(DP_Fritzbox_AnrufbeantworterLatestMessageTranskript, "Azure Key fehlt – Transkription nicht möglich", true);
-    return;
-  }
+  // Erst die Metadaten, dann das Transkript: Wer auf das Transkript reagiert,
+  // liest die Metadaten im selben Moment.
+  setState(DP_Fritzbox_AnrufbeantworterLatestMessageTranskript, transcript, true);
 
-  await transcribeWithAzure(tempFilePath);
+  // Ändert sich bei jeder Nachricht, auch wenn zwei Transkripte gleich lauten
+  // (z. B. "Transkript leer").
+  setState(
+    DP_Fritzbox_AnrufbeantworterLastProcessedMessage,
+    JSON.stringify({
+      key: messageKey(msg),
+      index,
+      date: flattened.Date,
+      name: flattened.Name,
+      number: flattened.Number,
+      duration: flattened.Duration,
+      transcript,
+      localPath: tempFilePath,
+      url: messageUrl,
+      processedAt: new Date().toISOString(),
+    }),
+    true
+  );
 }
 
 // ===============================
 // Azure Transcribe
 // ===============================
+// Liefert das Transkript oder eine Fehlermeldung als Text.
 async function transcribeWithAzure(tempFilePath) {
   const data = new FormData();
   data.append("definitions", JSON.stringify({ locales: [TAM_EXPECTED_LANGUAGE], profanityFilterMode: "None" }));
@@ -718,27 +844,18 @@ async function transcribeWithAzure(tempFilePath) {
     if (response.status < 200 || response.status >= 300) {
       const details = JSON.stringify(response.data);
       log(`[TAM] Azure HTTP ${response.status} data=${details}`, "error");
-      if (response.status === 401) {
-        setState(DP_Fritzbox_AnrufbeantworterLatestMessageTranskript, "Azure permission denied; Transkription fehlgeschlagen", true);
-      } else if (response.status === 400) {
-        setState(DP_Fritzbox_AnrufbeantworterLatestMessageTranskript, "Ungültige Anfrage (400); Transkription fehlgeschlagen", true);
-      } else {
-        setState(DP_Fritzbox_AnrufbeantworterLatestMessageTranskript, "Transkription fehlgeschlagen (Azure HTTP Fehler)", true);
-      }
-      return;
+      if (response.status === 401) return "Azure permission denied; Transkription fehlgeschlagen";
+      if (response.status === 400) return "Ungültige Anfrage (400); Transkription fehlgeschlagen";
+      return "Transkription fehlgeschlagen (Azure HTTP Fehler)";
     }
 
     const text = response.data?.combinedPhrases?.[0]?.text || "";
     if (debug) console.log("[TAM] Azure transcript:" + text);
 
-    setState(
-      DP_Fritzbox_AnrufbeantworterLatestMessageTranskript,
-      text === "" ? "Transkript leer" : text,
-      true
-    );
+    return text === "" ? "Transkript leer" : text;
   } catch (e) {
     log(`[TAM] Azure Request Fehler: ${String(e.message || e)}`, "error");
-    setState(DP_Fritzbox_AnrufbeantworterLatestMessageTranskript, "Transkription fehlgeschlagen (Request Error)", true);
+    return "Transkription fehlgeschlagen (Request Error)";
   }
 }
 
@@ -757,7 +874,7 @@ on({ id: DP_Fritzbox_AnrufbeantworterDeleteMessage, change: "any" }, async () =>
 
   try {
     await deleteTamMessage(DEFAULT_TAM_INDEX, idx);
-    await runTamWorkflow(DEFAULT_TAM_INDEX);
+    await runTamWorkflow(DEFAULT_TAM_INDEX, false);
   } catch (e) {
     log(`[TAM] DeleteMessage Fehler: ${String(e.message || e)}`, "error");
   }
@@ -767,7 +884,7 @@ on({ id: DP_Fritzbox_AnrufbeantworterDeleteMessage, change: "any" }, async () =>
 // Trigger: Manueller Button "DatenAktualisieren"
 // ===============================
 on({ id: DP_Fritzbox_AnrufbeantworterDatenAktualisieren, change: "any" }, async () => {
-  await runTamWorkflow(DEFAULT_TAM_INDEX);
+  await runTamWorkflow(DEFAULT_TAM_INDEX, false);
 });
 
 // ===============================
@@ -779,8 +896,10 @@ on({ id: DP_CM_EVENT, change: "ne" }, async (obj) => {
 
   if (evt.type !== "DISCONNECT") return;
 
-  // kleine Verzögerung, damit LastCall sicher geschrieben ist
-  await wait(5000); // war 300
+  // kleine Verzögerung, damit LastCall sicher geschrieben ist. Auf die neue
+  // Nachricht selbst wartet runTamWorkflow (POLL_INTERVAL_MS/POLL_MAX_MS),
+  // dafür war hier zwischenzeitlich wait(5000) eingebaut.
+  await wait(300);
 
   const lastCall = safeJsonParse(getState(DP_CM_LASTCALL).val) || {};
 
@@ -803,5 +922,5 @@ on({ id: DP_CM_EVENT, change: "ne" }, async (obj) => {
     console.log(`[CM] DISCONNECT (TAM) ext=${lastCall.extension} -> tamIndex=${tamIndex} caller=${caller}`);
   }
 
-  await runTamWorkflow(tamIndex);
+  await runTamWorkflow(tamIndex, true);
 });
