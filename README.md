@@ -25,6 +25,10 @@ This repository contains JavaScript scripts intended to run inside the **ioBroke
   Answering machine (TAM) workflow + Azure transcription.  
   **Prerequisites:** `FRITZ_SOAP_communication.js` **and** `FRITZ_CallMonitor.js`.
 
+- `FRITZ_TAM_notify.js`  
+  Notification for each new TAM message: e-mail right away (WAV attached), WhatsApp via the `whatsapp-cmb` adapter from `WHATSAPP_FROM` (default `09:30`) on; earlier messages are queued and sent then.  
+  **Prerequisite:** `FRITZ_TAM_transcribe.js` (reacts on its `…LastProcessedMessage` datapoint). Configure `EMAIL_INSTANCE`, `EMAIL_TO`, `WHATSAPP_INSTANCE`.
+
 - `TAM_transcribe.js`  
   Legacy/older variant that talks to the `tr-064` adapter datapoints (not the SOAP worker). Use only if you know you need that approach.
 
@@ -50,6 +54,7 @@ This repository contains JavaScript scripts intended to run inside the **ioBroke
 3. Import and start any “client” scripts:
    - `FRITZ_SOAP_InternetUsage.js`
    - `FRITZ_TAM_transcribe.js`
+   - `FRITZ_TAM_notify.js` (after `FRITZ_TAM_transcribe.js`)
    - your own scripts based on `FRITZ_SOAP_UsageSamples.js`
 
 ## Configuration notes
