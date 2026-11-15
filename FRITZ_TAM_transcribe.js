@@ -58,6 +58,11 @@ const POLL_MAX_MS = 60000;
 // die neuesten. Ältere werden ohne Transkript als verarbeitet gemerkt.
 const MAX_NEW_PER_RUN = 10;
 
+// Pause zwischen zwei Nachrichten eines Laufs. Scripts, die auf das Transkript
+// reagieren und dann LatestMessageData/LocalPath lesen, sollen noch die Werte
+// derselben Nachricht sehen, nicht schon die der nächsten.
+const PAUSE_BETWEEN_MESSAGES_MS = 2000;
+
 // ===============================
 // SST DPs (CallMonitor + SOAP Worker)
 // ===============================
@@ -578,7 +583,8 @@ async function processNewTamMessages(tamIndex, waitForNew) {
     );
   }
 
-  for (const msg of pending) {
+  for (const [i, msg] of pending.entries()) {
+    if (i > 0) await wait(PAUSE_BETWEEN_MESSAGES_MS);
     try {
       await processTamMessage(msg, list);
       processed.add(messageKey(msg));
