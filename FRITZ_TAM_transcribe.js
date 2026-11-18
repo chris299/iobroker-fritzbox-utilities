@@ -1,5 +1,5 @@
 /**
- * version 2026-11-15
+ * version 2026-11-18
  *
  * ioBroker Script B: FRITZ!Box Anrufbeantworter mit Azure Transkription (via SOAP Worker)
  *
@@ -28,6 +28,7 @@ const { URL } = require("url");
 const axios = require("axios");
 const FormData = require("form-data");
 const fs = require("node:fs");
+const https = require("node:https");
 
 // ===============================
 // Konfiguration
@@ -43,6 +44,18 @@ const AZURE_KEY = "fill_your_own_key_here";
 const AZURE_TRANSCRIBE_URL =
   "https://westeurope.api.cognitive.microsoft.com/speechtotext/transcriptions:transcribe?api-version=2024-11-15";
 const TAM_EXPECTED_LANGUAGE = "de-DE";
+
+// Azure (westeurope, germanywestcentral) bricht seit 2026-11-18 den TLS-Aufbau
+// ab ("Client network socket disconnected before secure TLS connection was
+// established"), wenn der Client den Post-Quanten-Schlüsselaustausch
+// X25519MLKEM768 anbietet. Node 22 mit OpenSSL 3.5 tut das von sich aus, das
+// ClientHello wird dadurch groß. curl (OpenSSL 3.0) und Node mit den
+// klassischen Kurven kommen durch. Deshalb ein eigener Agent nur für Azure.
+const AZURE_HTTPS_AGENT = new https.Agent({ ecdhCurve: "X25519:P-256:P-384" });
+
+// Netzfehler und vorübergehende Azure-Antworten (429, 5xx) wiederholen,
+// bevor "Transkription fehlgeschlagen" gemeldet wird.
+const AZURE_RETRY_DELAYS_MS = [5000, 15000];
 
 // Standard-TAM (Fallback), falls kein ext 40-49 erkennbar
 const DEFAULT_TAM_INDEX = 1;
@@ -62,6 +75,13 @@ const MAX_NEW_PER_RUN = 10;
 // reagieren und dann LatestMessageData/LocalPath lesen, sollen noch die Werte
 // derselben Nachricht sehen, nicht schon die der nächsten.
 const PAUSE_BETWEEN_MESSAGES_MS = 2000;
+
+// Direkt nach einem Neustart des javascript-Adapters starten dieses Script und
+// der SOAP Worker gleichzeitig. Dessen TR-064-Discovery braucht ein paar
+// Sekunden, bis dahin antwortet er DISCOVERY_NOT_READY. Dann später erneut
+// versuchen, statt den Lauf (und nachzuholende Nachrichten) fallen zu lassen.
+const WORKFLOW_RETRY_MS = 15000;
+const WORKFLOW_RETRY_MAX = 8;
 
 // ===============================
 // SST DPs (CallMonitor + SOAP Worker)
@@ -495,6 +515,8 @@ let workflowRunning = false;
 // Aufruf, der während eines Laufs kam. Nicht verwerfen: Ein zweiter Anruf,
 // während der erste noch auf seine Nachricht wartet, bringt eine weitere.
 let workflowRerun = null;
+let workflowRetries = 0;
+let workflowRetryTimer = null;
 
 async function runTamWorkflow(tamIndex, waitForNew = false) {
   if (workflowRunning) {
@@ -510,8 +532,27 @@ async function runTamWorkflow(tamIndex, waitForNew = false) {
       workflowRerun = null;
       try {
         await processNewTamMessages(next.tamIndex, next.waitForNew);
+        workflowRetries = 0;
       } catch (e) {
-        log(`[TAM] Workflow Fehler: ${String(e.message || e)}`, "error");
+        const msg = String(e.message || e);
+        const soapNichtBereit = /DISCOVERY_NOT_READY|Timeout waiting for SOAP_result/.test(msg);
+        if (soapNichtBereit && workflowRetries < WORKFLOW_RETRY_MAX) {
+          workflowRetries++;
+          log(
+            `[TAM] SOAP Worker noch nicht bereit (${msg.split(":")[0]}), neuer Versuch in ${WORKFLOW_RETRY_MS / 1000} s ` +
+              `(${workflowRetries}/${WORKFLOW_RETRY_MAX})`,
+            "info"
+          );
+          const again = next;
+          if (!workflowRetryTimer) {
+            workflowRetryTimer = setTimeout(() => {
+              workflowRetryTimer = null;
+              runTamWorkflow(again.tamIndex, again.waitForNew);
+            }, WORKFLOW_RETRY_MS);
+          }
+        } else {
+          log(`[TAM] Workflow Fehler: ${msg}`, "error");
+        }
       }
       next = workflowRerun;
     }
@@ -825,27 +866,49 @@ async function processTamMessage(msg, list) {
 // ===============================
 // Liefert das Transkript oder eine Fehlermeldung als Text.
 async function transcribeWithAzure(tempFilePath) {
-  const data = new FormData();
-  data.append("definitions", JSON.stringify({ locales: [TAM_EXPECTED_LANGUAGE], profanityFilterMode: "None" }));
-  data.append("audio", fs.createReadStream(tempFilePath));
+  for (let versuch = 0; ; versuch++) {
+    const nochmal = versuch < AZURE_RETRY_DELAYS_MS.length;
+    const pause = AZURE_RETRY_DELAYS_MS[versuch];
 
-  if (debug) console.log("[TAM] Azure transcribe POST...");
+    // Das Formular je Versuch neu bauen: Der Datei-Stream ist nach einem
+    // Versuch verbraucht.
+    const data = new FormData();
+    data.append("definitions", JSON.stringify({ locales: [TAM_EXPECTED_LANGUAGE], profanityFilterMode: "None" }));
+    data.append("audio", fs.createReadStream(tempFilePath));
 
-  try {
-    const response = await axios({
-      method: "post",
-      url: AZURE_TRANSCRIBE_URL,
-      headers: {
-        "Ocp-Apim-Subscription-Key": AZURE_KEY,
-        "User-Agent": "iobroker-javascript",
-        "Accept": "*/*",
-        "Connection": "keep-alive",
-        ...data.getHeaders(),
-      },
-      data,
-      timeout: 60000,
-      validateStatus: () => true,
-    });
+    if (debug) console.log(`[TAM] Azure transcribe POST...${versuch ? ` (Versuch ${versuch + 1})` : ""}`);
+
+    let response;
+    try {
+      response = await axios({
+        method: "post",
+        url: AZURE_TRANSCRIBE_URL,
+        headers: {
+          "Ocp-Apim-Subscription-Key": AZURE_KEY,
+          "User-Agent": "iobroker-javascript",
+          "Accept": "*/*",
+          ...data.getHeaders(),
+        },
+        data,
+        httpsAgent: AZURE_HTTPS_AGENT,
+        timeout: 60000,
+        validateStatus: () => true,
+      });
+    } catch (e) {
+      if (nochmal) {
+        log(`[TAM] Azure Request Fehler: ${String(e.message || e)}, neuer Versuch in ${pause / 1000} s`, "warn");
+        await wait(pause);
+        continue;
+      }
+      log(`[TAM] Azure Request Fehler: ${String(e.message || e)}`, "error");
+      return "Transkription fehlgeschlagen (Request Error)";
+    }
+
+    if ((response.status === 429 || response.status >= 500) && nochmal) {
+      log(`[TAM] Azure HTTP ${response.status}, neuer Versuch in ${pause / 1000} s`, "warn");
+      await wait(pause);
+      continue;
+    }
 
     if (response.status < 200 || response.status >= 300) {
       const details = JSON.stringify(response.data);
@@ -859,9 +922,6 @@ async function transcribeWithAzure(tempFilePath) {
     if (debug) console.log("[TAM] Azure transcript:" + text);
 
     return text === "" ? "Transkript leer" : text;
-  } catch (e) {
-    log(`[TAM] Azure Request Fehler: ${String(e.message || e)}`, "error");
-    return "Transkription fehlgeschlagen (Request Error)";
   }
 }
 
