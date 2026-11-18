@@ -126,6 +126,33 @@ Behavior:
 - After a TAM call ends, the message sometimes shows up in the FRITZ!Box list only a few seconds later. The script polls the list every `POLL_INTERVAL_MS` (5 s) for up to `POLL_MAX_MS` (60 s).
 - After each message it writes `…Fritzbox_AnrufbeantworterLastProcessedMessage` (JSON: date, name, number, transcript, local WAV path, …). Trigger notifications on this datapoint: it changes for every message, while `…LatestMessageTranskript` does not change when two transcripts are identical (e.g. empty messages).
 - At most `MAX_NEW_PER_RUN` (10) messages are transcribed per run, the newest ones. This guards against a flood of notifications if the list of processed messages gets lost.
+- Azure network errors and temporary Azure responses (429, 5xx) are retried after 5 s and 15 s (`AZURE_RETRY_DELAYS_MS`). Only then is "Transkription fehlgeschlagen" reported.
+- If the SOAP worker is not ready yet (`DISCOVERY_NOT_READY` or a timeout, typical right after a restart of the JavaScript adapter, when both scripts start at the same time), the run is retried every `WORKFLOW_RETRY_MS` (15 s), at most `WORKFLOW_RETRY_MAX` (8) times.
+
+#### Azure TLS: classic key exchange (`AZURE_HTTPS_AGENT`)
+
+Node.js 22 bundles OpenSSL 3.5, which by default also offers the post-quantum hybrid key exchange `X25519MLKEM768` in the TLS handshake. Since 2026-11-18, some Azure Cognitive Services endpoints reset the connection when that key share is offered. This was observed for `westeurope` and `germanywestcentral` (`*.api.cognitive.microsoft.com`); `northeurope` was not affected. The error looks like this:
+
+```
+[TAM] Azure Request Fehler: Client network socket disconnected before secure TLS connection was established
+```
+
+`curl` with the system OpenSSL (3.0) gets through, so the Azure key and network are fine. For this reason, the script sends its Azure requests through its own HTTPS agent that only offers the classic curves:
+
+```js
+const AZURE_HTTPS_AGENT = new https.Agent({ ecdhCurve: "X25519:P-256:P-384" });
+```
+
+The agent is passed to axios as `httpsAgent`. It only applies to the Azure request; the FRITZ!Box connections are unchanged.
+
+- Keep it if Azure does not work with the Node default: every transcription fails with the error above, and a retry does not help.
+- To check whether your region still needs it, compare a TLS connection with and without the classic curves. This assumes you run it from the ioBroker host with the same Node version:
+
+  ```bash
+  node -e 'const tls=require("tls"),h=process.argv[1];for(const o of [{},{ecdhCurve:"X25519:P-256:P-384"}]){const s=tls.connect({host:h,port:443,servername:h,...o},()=>{console.log(JSON.stringify(o),"ok");s.end()});s.on("error",e=>console.log(JSON.stringify(o),e.code))}' westeurope.api.cognitive.microsoft.com
+  ```
+
+  If `{}` returns `ECONNRESET` and the classic curves return `ok`, the agent is needed. If both return `ok`, the agent can be dropped. It does no harm to keep it.
 
 ## Security
 
