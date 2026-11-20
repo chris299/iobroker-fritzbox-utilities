@@ -64,7 +64,7 @@ This repository contains JavaScript scripts intended to run inside the **ioBroke
 Edit the config constants at the top:
 
 - `fritzIP`, `USE_TLS`, `tr64Port`, `tr64sPort`
-- `FRITZ_USER`, `FRITZ_PASS`
+- the **FRITZ!Box user and password in the ioBroker credential store**, not in the script: Admin → Basic settings → Credentials, add an entry with the ID `FritzBox` (`FRITZ_CREDENTIAL_ID`) using the template *Login/password*. The worker reads `SECRETS.FritzBox.login` and `.password` for every request, so a changed password applies at once. Requirements as for the Azure key (see section 4). If the entry is missing, the worker logs a warning at start.
 
 The worker performs service discovery on startup (`/tr64desc.xml` and `/igddesc.xml`). Client scripts send commands as JSON, e.g.:
 

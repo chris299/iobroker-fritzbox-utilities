@@ -1,6 +1,6 @@
 /*******************************************************
  * ioBroker Script A: FRITZ!Box SOAP Worker (Queue + Discovery + XML->JSON)
- * version: 2025-12-28
+ * version: 2026-11-20
  * Interface via zwei Datenpunkte:
  *   - 0_userdata.0.Fritzbox.SOAP_command  (Clients schreiben; Worker ACKt)
  *   - 0_userdata.0.Fritzbox.SOAP_result   (Worker schreibt; Clients lesen)
@@ -24,9 +24,21 @@ const fritzIP   =  "192.168.246.4";
 const tr64Port  =  "49000";
 const tr64sPort =  "49443";
 
-// TR-064 User (muss Rechte haben, z.B. Telefon)
-const FRITZ_USER = "iobroker";
-const FRITZ_PASS = "fill_your_own_password";
+// TR-064 User (muss Rechte haben, z.B. Telefon). Benutzer und Passwort stehen
+// nicht im Code, sondern im zentralen Speicher für Zugangsdaten von ioBroker:
+// Admin -> Basiseinstellungen -> Zugangsdaten, Eintrag FRITZ_CREDENTIAL_ID mit
+// Login und Passwort. Dort liegt das Passwort verschlüsselt, und beim Kopieren
+// des Scripts geht es nicht mit. Braucht js-controller 7.2 und im
+// javascript-Adapter "Skripten das Lesen der Zugangsdaten erlauben" (SECRETS).
+const FRITZ_CREDENTIAL_ID = "FritzBox";
+
+// Jedes Mal aus SECRETS lesen: Eine Änderung in der Admin-Oberfläche gilt sofort.
+function fritzUser() {
+  return (typeof SECRETS !== "undefined" && SECRETS[FRITZ_CREDENTIAL_ID]?.login) || "";
+}
+function fritzPass() {
+  return (typeof SECRETS !== "undefined" && SECRETS[FRITZ_CREDENTIAL_ID]?.password) || "";
+}
 
 // TR-064 Transport
 const USE_TLS   = true;
@@ -437,8 +449,8 @@ async function tr64SoapCall({
   params,
   timeoutMs = 10000,
   authMode = "tr64",
-  user = FRITZ_USER,
-  pass = FRITZ_PASS,
+  user = fritzUser(),
+  pass = fritzPass(),
 }) {
   await ensureDiscovery();
   if (!tr64.discovered) throw new Error("DISCOVERY_NOT_READY");
@@ -600,8 +612,8 @@ async function processQueue() {
           params: cmd.params,
           timeoutMs: cmd.timeoutMs,
           authMode: cmd.authMode,
-          user: cmd.user || FRITZ_USER,
-          pass: cmd.pass || FRITZ_PASS,
+          user: cmd.user || fritzUser(),
+          pass: cmd.pass || fritzPass(),
         });
 
         const data = soapXmlToUsefulJson(xml);
@@ -699,6 +711,15 @@ on({ id: DP_COMMAND, change: "any" }, async (obj) => {
 });
 
 // ---------- Start ----------
+if (!fritzUser() || !fritzPass()) {
+  log(
+    `[SOAP Worker] FRITZ!Box-Zugangsdaten fehlen: In Admin -> Basiseinstellungen -> Zugangsdaten einen Eintrag ` +
+      `"${FRITZ_CREDENTIAL_ID}" vom Typ "Login/Passwort" anlegen (javascript-Adapter: Lesen der Zugangsdaten erlauben)`,
+    "warn"
+  );
+} else {
+  log(`[SOAP Worker] FRITZ!Box-Zugangsdaten aus "${FRITZ_CREDENTIAL_ID}" gefunden (Benutzer ${fritzUser()})`, "info");
+}
 ensureDatapoint(DP_COMMAND, "TR-064 SOAP command (JSON)", true);
 ensureDatapoint(DP_RESULT,  "TR-064 SOAP result (JSON)",  false);
 
