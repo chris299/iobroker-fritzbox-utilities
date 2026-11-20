@@ -41,8 +41,13 @@ const debug = true;
 const ENABLE_TRANSCRIBE_DEFAULT = true;
 // const ENABLE_SEND_AUDIO_DEFAULT = false;
 
-// >>> HIER EINTRAGEN <<<
-const AZURE_KEY = "fill_your_own_key_here";
+// Der Azure-Schlüssel steht nicht im Code, sondern im zentralen Speicher für
+// Zugangsdaten von ioBroker: Admin -> Basiseinstellungen -> Zugangsdaten,
+// Eintrag mit der ID AZURE_CREDENTIAL_ID vom Typ "Schlüssel". Dort liegt er
+// verschlüsselt, und beim Kopieren des Scripts (Repo, GitHub, Forum) geht er
+// nicht mit. Braucht js-controller 7.2 und im javascript-Adapter die Option
+// "Skripten das Lesen der Zugangsdaten erlauben" (Objekt SECRETS).
+const AZURE_CREDENTIAL_ID = "AzureSpeech";
 const AZURE_TRANSCRIBE_URL =
   "https://westeurope.api.cognitive.microsoft.com/speechtotext/transcriptions:transcribe?api-version=2024-11-15";
 const TAM_EXPECTED_LANGUAGE = "de-DE";
@@ -336,6 +341,10 @@ async function ensureStateExists(id, initialValue, common) {
 
   if (!getState(DP_Fritzbox_AnrufbeantworterLatestMessageEnableTranskription).val) {
     setState(DP_Fritzbox_AnrufbeantworterLatestMessageTranskript, "Transkription deaktiviert", true);
+  } else if (!azureKey()) {
+    log(`[TAM] ${azureKeyMissingText()}`, "warn");
+  } else if (debug) {
+    console.log(`[TAM] Azure-Schlüssel aus den Zugangsdaten "${AZURE_CREDENTIAL_ID}" gefunden`);
   }
 
   if (await logMissingPrerequisiteDatapoints()) {
@@ -889,7 +898,8 @@ async function processTamMessage(msg, list) {
   if (!transcribeEnabled) {
     transcript = "Transkription deaktiviert";
     if (debug) console.log("[TAM] Transkription deaktiviert");
-  } else if (!AZURE_KEY || AZURE_KEY === "PUT_YOUR_KEY_HERE" || AZURE_KEY === "fill_your_own_key_here") {
+  } else if (!azureKey()) {
+    log(`[TAM] ${azureKeyMissingText()}`, "error");
     transcript = "Azure Key fehlt – Transkription nicht möglich";
   } else {
     transcript = await transcribeWithAzure(tempFilePath);
@@ -922,6 +932,19 @@ async function processTamMessage(msg, list) {
 // ===============================
 // Azure Transcribe
 // ===============================
+// Jedes Mal aus SECRETS lesen: Ein in der Admin-Oberfläche geänderter
+// Schlüssel gilt dann sofort, ohne Neustart des Scripts.
+function azureKey() {
+  return (typeof SECRETS !== "undefined" && SECRETS[AZURE_CREDENTIAL_ID]?.key) || "";
+}
+
+function azureKeyMissingText() {
+  return (
+    `Azure-Schlüssel fehlt: In Admin -> Basiseinstellungen -> Zugangsdaten einen Eintrag ` +
+    `"${AZURE_CREDENTIAL_ID}" vom Typ "Schlüssel" anlegen (javascript-Adapter: Lesen der Zugangsdaten erlauben)`
+  );
+}
+
 // Liefert das Transkript oder eine Fehlermeldung als Text.
 async function transcribeWithAzure(tempFilePath) {
   for (let versuch = 0; ; versuch++) {
@@ -942,7 +965,7 @@ async function transcribeWithAzure(tempFilePath) {
         method: "post",
         url: AZURE_TRANSCRIBE_URL,
         headers: {
-          "Ocp-Apim-Subscription-Key": AZURE_KEY,
+          "Ocp-Apim-Subscription-Key": azureKey(),
           "User-Agent": "iobroker-javascript",
           "Accept": "*/*",
           ...data.getHeaders(),

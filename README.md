@@ -111,7 +111,7 @@ Requires:
 
 Configure at least:
 
-- `AZURE_KEY`
+- the **Azure key in the ioBroker credential store**, not in the script: Admin → Basic settings → Credentials, add an entry with the ID `AzureSpeech` (`AZURE_CREDENTIAL_ID`) of the type *key*. It is stored encrypted, the script reads it as `SECRETS.AzureSpeech.key`, and a changed key is used right away. This needs js-controller 7.2 or newer and the JavaScript adapter option *Allow scripts to read the credentials* (tested with js-controller 7.2.5 and javascript 10.4.4). If the entry is missing, the script logs a warning at start and the transcript reads "Azure Key fehlt – Transkription nicht möglich".
 - `AZURE_TRANSCRIBE_URL` (region-specific)
 - `DEFAULT_TAM_INDEX` (fallback TAM)
 
@@ -157,7 +157,7 @@ The agent is passed to axios as `httpsAgent`. It only applies to the Azure reque
 
 ## Security
 
-- Do not commit real credentials/API keys. Prefer ioBroker script globals, encrypted objects, or environment-based secrets.
+- Do not commit real credentials/API keys. Prefer the ioBroker credential store (`SECRETS`, see `FRITZ_TAM_transcribe.js`), encrypted objects, or environment-based secrets.
 - If you use TLS (`49443`), the worker uses an HTTPS agent with `rejectUnauthorized: false` (self-signed certs). If you want strict TLS verification, adjust this.
 
 ## License
