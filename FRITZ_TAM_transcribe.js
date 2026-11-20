@@ -1,5 +1,5 @@
 /**
- * version 2026-11-18
+ * version 2026-11-20
  *
  * ioBroker Script B: FRITZ!Box Anrufbeantworter mit Azure Transkription (via SOAP Worker)
  *
@@ -8,6 +8,8 @@
  * ...Fritzbox_AnrufbeantworterProcessedMessages. Nach jeder Nachricht wird
  * ...Fritzbox_AnrufbeantworterLastProcessedMessage geschrieben (JSON mit
  * Metadaten und Transkript), darauf kann ein Benachrichtigungs-Script reagieren.
+ * Ist der AB voll (TAM_MAX_MESSAGES), wird ...Fritzbox_AnrufbeantworterVoll
+ * true, auch darauf kann es reagieren.
  *
  * Dieses Script nutzt:
  * - Trigger: CallMonitor (Port 1012) DPs aus  CallMonitor-Script
@@ -65,6 +67,13 @@ const DEFAULT_TAM_INDEX = 1;
 // einmal fest zu warten.
 const POLL_INTERVAL_MS = 5000;
 const POLL_MAX_MS = 60000;
+
+// Mehr Nachrichten nimmt der AB nicht auf. Danach hören Anrufer nur noch die
+// Ansage, es kommt keine Nachricht mehr an (beobachtet 2026-11-19/20: 48
+// Anrufe ohne Nachricht, bis von Hand gelöscht wurde). Dann wird nicht auf
+// eine neue Nachricht gewartet, und ...Fritzbox_AnrufbeantworterVoll wird
+// true, darauf meldet FRITZ_TAM_notify.js.
+const TAM_MAX_MESSAGES = 254;
 
 // Sicherung gegen eine Flut von Transkripten und Meldungen, falls die Liste
 // der verarbeiteten Nachrichten verloren geht: höchstens so viele pro Lauf,
@@ -160,6 +169,8 @@ const DP_Fritzbox_AnrufbeantworterProcessedMessages =
   DP_base_Fritzbox_TAM + DEFAULT_TAM_INDEX + ".Fritzbox_AnrufbeantworterProcessedMessages";
 const DP_Fritzbox_AnrufbeantworterLastProcessedMessage =
   DP_base_Fritzbox_TAM + DEFAULT_TAM_INDEX + ".Fritzbox_AnrufbeantworterLastProcessedMessage";
+const DP_Fritzbox_AnrufbeantworterVoll =
+  DP_base_Fritzbox_TAM + DEFAULT_TAM_INDEX + ".Fritzbox_AnrufbeantworterVoll";
 
 // ===============================
 // State Setup
@@ -310,6 +321,15 @@ async function ensureStateExists(id, initialValue, common) {
     type: "string",
     role: "json",
     def: "",
+    read: true,
+    write: false,
+  });
+
+  await ensureStateExists(DP_Fritzbox_AnrufbeantworterVoll, false, {
+    name: `Anrufbeantworter voll (${TAM_MAX_MESSAGES} Nachrichten), Anrufer können nichts mehr aufsprechen`,
+    type: "boolean",
+    role: "indicator.alarm",
+    def: false,
     read: true,
     write: false,
   });
@@ -584,13 +604,23 @@ async function deleteTamMessage(tamIndex, messageIndex) {
 // Kernfunktion: alle noch nicht verarbeiteten Nachrichten abarbeiten
 // ===============================
 async function processNewTamMessages(tamIndex, waitForNew) {
-  const deadline = Date.now() + (waitForNew ? POLL_MAX_MS : 0);
+  const start = Date.now();
+  const deadline = start + (waitForNew ? POLL_MAX_MS : 0);
   let list;
   let processed;
   let pending;
+  let polls = 0;
+  let lastCount = -1;
 
   for (;;) {
-    list = await fetchTamMessageList(tamIndex);
+    // Nur die erste Abfrage ausführlich loggen, sonst stehen pro Anruf bis
+    // zu 36 Zeilen im Log
+    list = await fetchTamMessageList(tamIndex, polls > 0);
+    polls++;
+    if (debug && polls > 1 && list.messages.length !== lastCount) {
+      console.log(`[TAM] Nachrichten in der Liste: ${list.messages.length} (Abfrage ${polls})`);
+    }
+    lastCount = list.messages.length;
 
     processed = loadProcessedKeys();
     if (processed === null) {
@@ -603,12 +633,18 @@ async function processNewTamMessages(tamIndex, waitForNew) {
     }
 
     pending = list.messages.filter((msg) => !processed.has(messageKey(msg)));
-    if (pending.length > 0 || Date.now() >= deadline) break;
+    // Bei vollem AB kann keine neue Nachricht mehr kommen, Warten ist zwecklos
+    if (pending.length > 0 || Date.now() >= deadline || list.full) break;
     await wait(POLL_INTERVAL_MS);
   }
 
   if (pending.length === 0) {
-    if (debug && waitForNew) console.log("[TAM] Keine neue Nachricht gefunden (vor dem Signalton aufgelegt?)");
+    if (waitForNew && list.full) {
+      log(`[TAM] AB voll (${list.messages.length} Nachrichten), der Anrufer konnte keine Nachricht hinterlassen`, "info");
+    } else if (debug && waitForNew) {
+      const s = Math.round((Date.now() - start) / 1000);
+      console.log(`[TAM] Keine neue Nachricht nach ${polls} Abfragen in ${s} s (vor dem Signalton aufgelegt?)`);
+    }
     return;
   }
 
@@ -640,9 +676,28 @@ async function processNewTamMessages(tamIndex, waitForNew) {
 }
 
 // ===============================
+// AB voll? Nur beim Wechsel loggen und den DP schreiben
+// ===============================
+function updateFullState(full, count) {
+  const was = !!getState(DP_Fritzbox_AnrufbeantworterVoll)?.val;
+  if (full === was) return;
+  setState(DP_Fritzbox_AnrufbeantworterVoll, full, true);
+  if (full) {
+    log(
+      `[TAM] Anrufbeantworter voll (${count} Nachrichten): Anrufer können keine Nachricht mehr hinterlassen. ` +
+        `Bitte alte Nachrichten löschen.`,
+      "warn"
+    );
+  } else {
+    log(`[TAM] Anrufbeantworter nimmt wieder Nachrichten auf (${count} Nachrichten)`, "info");
+  }
+}
+
+// ===============================
 // GetMessageList -> calllist.xml -> parse, dazu die Anzeige-DPs aktualisieren
 // ===============================
-async function fetchTamMessageList(tamIndex) {
+// quiet: keine Debug-Zeilen, für die wiederholten Abfragen beim Warten
+async function fetchTamMessageList(tamIndex, quiet = false) {
   const parseString = require("xml2js").parseString;
 
   // 1) SOAP GetMessageList via Worker
@@ -653,7 +708,7 @@ async function fetchTamMessageList(tamIndex) {
     timeoutMs: 10000,
   };
 
-  if (debug) console.log("[TAM] SOAP GetMessageList cmd:" + JSON.stringify(cmd));
+  if (debug && !quiet) console.log("[TAM] SOAP GetMessageList cmd:" + JSON.stringify(cmd));
   const soapRes = await soapCall(cmd, 15000);
 
   // Worker liefert JSON. Wir erwarten NewURL als String.
@@ -669,7 +724,7 @@ async function fetchTamMessageList(tamIndex) {
 
   const baseUrl = fullCalllistUrl.origin + fullCalllistUrl.pathname; // ohne Query
 
-  if (debug) console.log(`[TAM] baseUrl=${baseUrl} tamIndex=${tamIndex}`);
+  if (debug && !quiet) console.log(`[TAM] baseUrl=${baseUrl} tamIndex=${tamIndex}`);
 
   // 3) calllist.xml holen (FRITZ!Box docu verlangt POST sid + tamindex, geht aber auch per GET)
   const postBody = `sid=${encodeURIComponent(sid)}&tamindex=${encodeURIComponent(tamIndex)}`;
@@ -714,9 +769,12 @@ async function fetchTamMessageList(tamIndex) {
   // Nicht die ganze Liste loggen: Sie enthält Namen und Nummern aller Anrufer,
   // und beim Warten auf eine neue Nachricht wird sie mehrfach geholt.
   const messages = Array.isArray(parsed?.Root?.Message) ? parsed.Root.Message.slice() : [];
-  if (debug) console.log(`[TAM] tam calls=${tamCalls}, Nachrichten in der Liste: ${messages.length}`);
+  if (debug && !quiet) console.log(`[TAM] tam calls=${tamCalls}, Nachrichten in der Liste: ${messages.length}`);
 
-  const list = { messages, sid, origin: fullCalllistUrl.origin };
+  const list = { messages, sid, origin: fullCalllistUrl.origin, full: messages.length >= TAM_MAX_MESSAGES };
+  // Eine leere Liste kann auch ein Aussetzer der FRITZ!Box sein, dann den
+  // Zustand nicht ändern (sonst käme beim nächsten Abruf erneut "voll")
+  if (messages.length > 0) updateFullState(list.full, messages.length);
 
   // 5) Wenn keine Nachrichten
   if (!tamCalls || tamCalls === 0 || messages.length === 0) {

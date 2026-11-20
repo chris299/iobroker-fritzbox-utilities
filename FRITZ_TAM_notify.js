@@ -1,5 +1,5 @@
 /**
- * version 2026-11-15
+ * version 2026-11-20
  *
  * ioBroker Script C: Meldung neuer Anrufbeantworter-Nachrichten per E-Mail und WhatsApp
  *
@@ -14,6 +14,8 @@
  * - WhatsApp (CallMeBot, Adapter whatsapp-cmb) erst ab WHATSAPP_FROM. Was
  *   vorher kommt, wird gesammelt und um WHATSAPP_FROM nachgeschickt, auch
  *   nach einem Neustart.
+ * - Wird der AB voll (...Fritzbox_AnrufbeantworterVoll), einmal E-Mail und
+ *   WhatsApp, denn dann kommen keine Nachrichten mehr an.
  */
 
 // ===============================
@@ -24,6 +26,7 @@ const debug = true;
 const DP_ROOT_TAM = "0_userdata.0.Fritzbox.Anrufbeantworter.1";
 const DP_EVENT = DP_ROOT_TAM + ".Fritzbox_AnrufbeantworterLastProcessedMessage";
 const DP_WHATSAPP_QUEUE = DP_ROOT_TAM + ".Fritzbox_AnrufbeantworterWhatsAppQueue";
+const DP_FULL = DP_ROOT_TAM + ".Fritzbox_AnrufbeantworterVoll";
 
 // >>> HIER EINTRAGEN <<<
 const EMAIL_INSTANCE = "email.0";
@@ -60,6 +63,19 @@ function saveQueue(queue) {
 
 function sendWhatsApp(text) {
   sendTo(WHATSAPP_INSTANCE, "send", { text });
+}
+
+// Ab WHATSAPP_FROM sofort, vorher in die Warteschlange
+function sendWhatsAppNowOrLater(text) {
+  if (!WHATSAPP_INSTANCE) return;
+  if (compareTime(WHATSAPP_FROM, null, ">")) {
+    sendWhatsApp(text);
+  } else {
+    const queue = loadQueue();
+    queue.push(text);
+    saveQueue(queue);
+    if (debug) console.log(`[TAM-Meldung] WhatsApp bis ${WHATSAPP_FROM} zurückgestellt (${queue.length} wartend)`);
+  }
 }
 
 let flushing = false;
@@ -119,15 +135,20 @@ on({ id: DP_EVENT, change: "any" }, (obj) => {
     attachments: m.localPath ? [{ path: m.localPath, cid: "file1" }] : [],
   });
 
-  if (!WHATSAPP_INSTANCE) return;
-  if (compareTime(WHATSAPP_FROM, null, ">")) {
-    sendWhatsApp(text);
-  } else {
-    const queue = loadQueue();
-    queue.push(text);
-    saveQueue(queue);
-    if (debug) console.log(`[TAM-Meldung] WhatsApp bis ${WHATSAPP_FROM} zurückgestellt (${queue.length} wartend)`);
-  }
+  sendWhatsAppNowOrLater(text);
+});
+
+// ===============================
+// AB voll: einmal melden (beim Wechsel auf true, nicht bei jedem Neustart)
+// ===============================
+on({ id: DP_FULL, change: "ne", val: true, ack: true }, () => {
+  const text =
+    "Der Anrufbeantworter ist voll. Anrufer können keine Nachricht mehr hinterlassen. " +
+    "Bitte alte Nachrichten löschen.";
+  log("[TAM-Meldung] AB voll, melde per E-Mail und WhatsApp", "info");
+
+  sendTo(EMAIL_INSTANCE, "send", { text, to: EMAIL_TO, subject: "Anrufbeantworter voll" });
+  sendWhatsAppNowOrLater(text);
 });
 
 // ===============================

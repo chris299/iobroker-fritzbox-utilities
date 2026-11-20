@@ -26,8 +26,8 @@ This repository contains JavaScript scripts intended to run inside the **ioBroke
   **Prerequisites:** `FRITZ_SOAP_communication.js` **and** `FRITZ_CallMonitor.js`.
 
 - `FRITZ_TAM_notify.js`  
-  Notification for each new TAM message: e-mail right away (WAV attached), WhatsApp via the `whatsapp-cmb` adapter from `WHATSAPP_FROM` (default `09:30`) on; earlier messages are queued and sent then.  
-  **Prerequisite:** `FRITZ_TAM_transcribe.js` (reacts on its `…LastProcessedMessage` datapoint). Configure `EMAIL_INSTANCE`, `EMAIL_TO`, `WHATSAPP_INSTANCE`.
+  Notification for each new TAM message: e-mail right away (WAV attached), WhatsApp via the `whatsapp-cmb` adapter from `WHATSAPP_FROM` (default `09:30`) on; earlier messages are queued and sent then. When the TAM becomes full, one e-mail and one WhatsApp say so.  
+  **Prerequisite:** `FRITZ_TAM_transcribe.js` (reacts on its `…LastProcessedMessage` and `…Voll` datapoints). Configure `EMAIL_INSTANCE`, `EMAIL_TO`, `WHATSAPP_INSTANCE`.
 
 - `TAM_transcribe.js`  
   Legacy/older variant that talks to the `tr-064` adapter datapoints (not the SOAP worker). Use only if you know you need that approach.
@@ -123,7 +123,8 @@ Behavior:
 - Automatically triggers on CallMonitor `DISCONNECT` events when the script detects a TAM port (heuristic: extensions `40..49`)
 - Processes **every message not processed yet**, oldest first, not just the newest one. Processed messages are remembered in `…Fritzbox_AnrufbeantworterProcessedMessages` by the key `Date|Index|Number|Duration` (the FRITZ!Box reuses message indexes after a while, and its `New` flag is reset when someone listens on the phone).
 - On the very first start, all messages already on the TAM are marked as processed, so no old messages get transcribed. On later starts, messages that arrived while the script was stopped are picked up.
-- After a TAM call ends, the message sometimes shows up in the FRITZ!Box list only a few seconds later. The script polls the list every `POLL_INTERVAL_MS` (5 s) for up to `POLL_MAX_MS` (60 s).
+- After a TAM call ends, the message sometimes shows up in the FRITZ!Box list only a few seconds later. The script polls the list every `POLL_INTERVAL_MS` (5 s) for up to `POLL_MAX_MS` (60 s). Only the first poll is logged in detail, then changes of the message count and one summary line.
+- **Full TAM:** the FRITZ!Box keeps at most `TAM_MAX_MESSAGES` (254) messages. When the TAM is full, callers only hear the announcement and no message is recorded. The script then sets `…Fritzbox_AnrufbeantworterVoll` to `true` (and logs one warning when this changes), and it does not poll after a call, because no new message can arrive. Delete old messages to make room; the datapoint goes back to `false` on the next run.
 - After each message it writes `…Fritzbox_AnrufbeantworterLastProcessedMessage` (JSON: date, name, number, transcript, local WAV path, …). Trigger notifications on this datapoint: it changes for every message, while `…LatestMessageTranskript` does not change when two transcripts are identical (e.g. empty messages).
 - At most `MAX_NEW_PER_RUN` (10) messages are transcribed per run, the newest ones. This guards against a flood of notifications if the list of processed messages gets lost.
 - Azure network errors and temporary Azure responses (429, 5xx) are retried after 5 s and 15 s (`AZURE_RETRY_DELAYS_MS`). Only then is "Transkription fehlgeschlagen" reported.
